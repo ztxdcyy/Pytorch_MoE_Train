@@ -151,20 +151,6 @@ def train_tiny_ep(
         opt.step()
 
         if rank == 0 and step % log_interval == 0:
-            gate_g = gate.weight.grad.norm().item() if gate.weight.grad is not None else 0.0
-            exp0_g = (
-                experts[0].net[0].weight.grad.norm().item()
-                if experts[0].net[0].weight.grad is not None
-                else 0.0
-            )
-            live_grads = sum(
-                1
-                for exp in experts
-                if exp.net[0].weight.grad is not None and exp.net[0].weight.grad.norm().item() > 0
-            )
-            print(
-                f"gate grad {gate_g:.4e} | exp0 grad {exp0_g:.4e} | experts with grad {live_grads}/{len(experts)}"
-            )
             print(
                 f"[step {step:05d}] task={task_loss.item():.4f} aux={aux_loss.item():.4f} total={total_loss.item():.4f}"
             )
@@ -172,15 +158,6 @@ def train_tiny_ep(
             writer.add_scalar("loss/task", task_loss.item(), step)
             writer.add_scalar("loss/aux", aux_loss.item(), step)
             writer.add_scalar("loss/total", total_loss.item(), step)
-            # 梯度监控
-            if gate.weight.grad is not None:
-                writer.add_scalar("grad/gate_weight_norm", gate.weight.grad.norm().item(), step)
-            else:
-                writer.add_scalar("grad/gate_weight_norm", 0.0, step)
-            if experts[0].net[0].weight.grad is not None:
-                writer.add_scalar("grad/expert0_weight_norm", experts[0].net[0].weight.grad.norm().item(), step)
-            else:
-                writer.add_scalar("grad/expert0_weight_norm", 0.0, step)
 
     dist.barrier()
     if writer:
