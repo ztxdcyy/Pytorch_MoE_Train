@@ -2,6 +2,7 @@
 import os
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import dataclasses
 from config import MoEConfig
 
@@ -65,7 +66,7 @@ class PyTorchAllToAll:
         rank 2: [3, 1, 0, 5]  # 将从rank 0接收3个token，rank 1接收1个token，rank 2接收0个token，rank 3接收5个token
         rank 3: [2, 3, 4, 0]  # 将从rank 0接收2个token，rank 1接收3个token，rank 2接收4个token，rank 3接收0个token
         """
-        dist.all_to_all_single(recv_counts_t, send_counts_t)          
+        dist_nn.all_to_all_single(recv_counts_t, send_counts_t)          
         # 对于每个rank来说，send_counts_t 和 recv_counts_t都只是 world_size 维度的向量，代表本 rank 需要向其他 rank 发送/接收 token 的数量。  
 
         # ---------3. 组织 send_buf&recv_buf + send_meta&recv_meta ----------
@@ -110,15 +111,15 @@ class PyTorchAllToAll:
             total_recv, self.META_DIM, dtype=torch.int32, device=device
         )
 
-        # ---------4. 调用 all_to_all_single通信，往 recv_buf & recv_meta 里写入。注意 uneven split 要额外引入 split_sizes --------------
-        dist.all_to_all_single(
+        # ---------4. 调用 all_to_all_single 通信，往 recv_buf & recv_meta 里写入。注意 uneven split 要额外引入 split_sizes --------------
+        dist_nn.all_to_all_single(
             recv_buf,
             send_buf,                                       # 因为每个专家收到的token数量不一致，而每个rank又持有相同数量的本地专家，因此每个rank收到的（相应的，发送的）token数量也不一致
             output_split_sizes=recv_counts_t.tolist(),      # output_split_sizes 记录了该 rank 需要从所有 rank 中接收多少 token
             input_split_sizes=send_counts_t.tolist(),       # input_split_sizes 记录了该 rank 需要向其余每个 rank 发送多少个 token
         )
 
-        dist.all_to_all_single(
+        dist_nn.all_to_all_single(
             recv_meta.view(-1),     # 展平成向量
             send_meta.view(-1),
             # recv_counts_t 原本是 tensor，先转 pythonlist，再用列表推导式提取每个 slot 上的数量 count（c）
@@ -233,7 +234,7 @@ class PyTorchAllToAll:
         recv_counts_t = torch.empty(self.world_size, dtype=torch.long, device=device)
         
         # 依旧“转置”：由perrank发送情况，得到perrank接收情况
-        dist.all_to_all_single(recv_counts_t, send_counts_t)
+        dist_nn.all_to_all_single(recv_counts_t, send_counts_t)
 
         # ---------3. 组织 send_buf&recv_buf + send_meta&recv_meta ----------
         y_map_tensors = []
@@ -261,14 +262,14 @@ class PyTorchAllToAll:
         )
 
         # ---------4. 调用 all_to_all_single 通信，往 recv_buf & recv_meta 里写入。--------------
-        dist.all_to_all_single(
+        dist_nn.all_to_all_single(
             recv_buf,
             send_buf,
             output_split_sizes=recv_counts_t.tolist(),
             input_split_sizes=send_counts_t.tolist(),
         )
         
-        dist.all_to_all_single(
+        dist_nn.all_to_all_single(
             recv_meta.view(-1),
             send_meta.view(-1),     # 注意 uneven split 要额外引入 split_sizes 
             output_split_sizes=[c * self.META_DIM for c in recv_counts_t.tolist()],
@@ -292,52 +293,3 @@ class PyTorchAllToAll:
         out = out.index_add(0, idx, updates)        # TODO Pytorch 向量化操作代替for循环
         out = out + out_tokens.to(torch.float32)  # 保留原 out_tokens 内容（通常为 0）
         return out.to(out_tokens.dtype)
-
-
-# def generate_input(
-#     num_experts, experts_per_token, hidden_dim, max_num_tokens, seed, rank, world_size
-# ):
-#     device = torch.device(f"cuda:{rank}")
-#     gen = torch.Generator(device=device)
-#     gen.manual_seed(seed + rank)
-
-#     cfg = MoEConfig(
-#         num_experts=num_experts,
-#         experts_per_token=experts_per_token,
-#         hidden_dim=hidden_dim,
-#         max_num_tokens=max_num_tokens,
-#         in_dtype=torch.float16,
-#         out_dtype=torch.float16,
-#     )
-#     rank_data = RankTestData(cfg, gen, rank)
-#     return cfg, rank_data, rank, world_size
-
-
-# def ref_kernel(data: input_t) -> output_t:
-#     cfg, rank_data, rank, world_size = data
-
-#     ata = PyTorchAllToAll(cfg, rank, world_size)
-
-#     expert_num, expert_x, expert_meta = ata.dispatch(rank_data.x, rank_data.indices)
-#     expert_y = expert_x.to(cfg.out_dtype) * (1 + rank)
-#     y = torch.zeros(
-#         cfg.max_num_tokens,
-#         cfg.hidden_dim,
-#         dtype=cfg.out_dtype,
-#         device=rank_data.x.device,
-#     )
-
-#     ata.combine(y, rank_data.weights, expert_meta, expert_y, expert_num)
-
-#     return y[: rank_data.num_tokens]
-
-
-# def check_implementation(data: input_t, output: output_t):
-#     expected = ref_kernel(data)
-#     if output.device != expected.device:
-#         return False, f"Output device mismatch: {output.device} != {expected.device}"
-#     res = torch.allclose(output, expected, rtol=1e-2, atol=5e-3)
-#     if not res:
-#         return False, f"Output values mismatch, {output} != {expected}"
-
-#     return True, ""
