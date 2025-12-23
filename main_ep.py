@@ -1,10 +1,13 @@
 import os
+import time
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from config import MoEConfig
+from config_defaults import get_default_cfg, get_default_train_cfg
 from reference import PyTorchAllToAll
 from layers.expert import Expert
 
@@ -19,7 +22,7 @@ def init_distributed():
 
 def build_modules(cfg: MoEConfig, hidden_dim: int):
     """Build gate (global) and local experts (per rank)."""
-    gate = nn.Linear(hidden_dim, cfg.num_experts)       # 每个rank都有一份相同的gate
+    gate = nn.Linear(hidden_dim, cfg.num_experts)       # gate 用 DDP 同步
     # num_local_experts is per-rank
     world_size = dist.get_world_size()
     num_local_experts = cfg.num_experts // world_size
@@ -36,6 +39,7 @@ def train_tiny_ep(
     lr: float = 5e-4,
     log_interval: int = 1000,
     aux_alpha: float = 1e-2,
+    profile: bool = False,
 ):
     """Minimal EP-only training loop to sanity check all-to-all wiring."""
     rank = dist.get_rank()
@@ -51,21 +55,16 @@ def train_tiny_ep(
     ata = PyTorchAllToAll(cfg, rank, world_size)
     gate, experts = build_modules(cfg, cfg.hidden_dim)
     gate.to(device)
+    gate = DDP(gate, device_ids=[device] if device.type == "cuda" else None)
     experts.to(device)
 
-    # 提升 gate 学习率，便于路由尽快有效；FP32 训练更稳
-    # 真正的问题应该不在这里，需要删掉
-    opt = torch.optim.AdamW(
-        [
-            {"params": gate.parameters(), "lr": lr * 2.0},
-            {"params": experts.parameters(), "lr": lr},
-        ]
-    )
+    opt = torch.optim.AdamW(list(gate.parameters()) + list(experts.parameters()), lr=lr)
     target_proj = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False).to(device)          # 给定一个模拟训练任务：使得moe网络近似拟合该linear
     target_proj.requires_grad_(False)           # 用于生成label，并不需要训练
     mse = nn.MSELoss()
     writer = SummaryWriter(log_dir=os.environ.get("TB_LOGDIR")) if rank == 0 else None
 
+    start_time = time.perf_counter()
     for step in range(steps):
         # 1) synthetic data
         x = torch.randn(bsz, cfg.hidden_dim, device=device, dtype=cfg.in_dtype)
@@ -76,7 +75,7 @@ def train_tiny_ep(
         logits = gate(x)
         probs = torch.softmax(logits, dim=-1)   # 温度平滑，避免过尖导致路由难训练
         weights, indices = torch.topk(probs, cfg.experts_per_token, dim=-1)
-        indices = indices.to(torch.int32)
+        indices = indices.to(torch.int64)  # scatter 需要 int64 索引
         weights = weights.to(torch.float32)
 
         # 2.1 aux loss（负载均衡）
@@ -158,6 +157,10 @@ def train_tiny_ep(
             writer.add_scalar("loss/task", task_loss.item(), step)
             writer.add_scalar("loss/aux", aux_loss.item(), step)
             writer.add_scalar("loss/total", total_loss.item(), step)
+    
+    if profile and rank == 0:
+        elapsed = time.perf_counter() - start_time
+        print(f"[ep] total {steps} steps time: {elapsed:.2f}s | {elapsed/steps*1000:.2f} ms/step")
 
     dist.barrier()
     if writer:
@@ -167,21 +170,8 @@ def train_tiny_ep(
 
 def main():
     init_distributed()
-    cfg = MoEConfig(                                # MoE 配置（按需修改）
-        num_experts=16,
-        experts_per_token=2,
-        hidden_dim=256,
-        max_num_tokens=128,
-        in_dtype=torch.float32,
-        out_dtype=torch.float32,
-    )
-    train_cfg = {                                   # 训练超参（便于调试时直接改）
-        "steps": 10000,
-        "bsz": 32,
-        "lr": 5e-4,
-        "log_interval": 1000,
-        "aux_alpha": 1e-2,
-    }
+    cfg = get_default_cfg()
+    train_cfg = get_default_train_cfg()
     train_tiny_ep(cfg, **train_cfg)
     if dist.get_rank() == 0:
         print("EP MoE tiny training finished.")
@@ -190,3 +180,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

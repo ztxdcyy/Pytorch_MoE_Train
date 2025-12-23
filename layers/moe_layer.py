@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from expert import Expert
+from .expert import Expert
 
 # MoE 核心模块
 class MoE(nn.Module):
