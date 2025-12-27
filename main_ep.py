@@ -22,7 +22,7 @@ def init_distributed():
 
 def build_modules(cfg: MoEConfig, hidden_dim: int):
     """Build gate (global) and local experts (per rank)."""
-    gate = nn.Linear(hidden_dim, cfg.num_experts)       # gate 用 DDP 同步
+    gate = nn.Linear(hidden_dim, cfg.num_experts)       
     # num_local_experts is per-rank
     world_size = dist.get_world_size()
     num_local_experts = cfg.num_experts // world_size
@@ -42,25 +42,29 @@ def train_tiny_ep(
     profile: bool = False,
 ):
     """Minimal EP-only training loop to sanity check all-to-all wiring."""
+    # 分布式相关初始化
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    # cuda: 0, 1
     device = (
         torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
         if torch.cuda.is_available()
         else torch.device("cpu")
     )
     if device.type == "cuda":
-        torch.cuda.set_device(device.index)
+        torch.cuda.set_device(device.index)     # 绑定 rank 到cuda device
 
+    # 实例化要用到的网络和ata算子
     ata = PyTorchAllToAll(cfg, rank, world_size)
     gate, experts = build_modules(cfg, cfg.hidden_dim)
     gate.to(device)
-    gate = DDP(gate, device_ids=[device] if device.type == "cuda" else None)
+    gate = DDP(gate, device_ids=[device] if device.type == "cuda" else None)        # gate 用 DDP 同步
     experts.to(device)
 
+    # 训练相关（优化器和模拟的任务——训练moe拟合一个nn.Linear()）初始化
     opt = torch.optim.AdamW(list(gate.parameters()) + list(experts.parameters()), lr=lr)
     target_proj = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False).to(device)          # 给定一个模拟训练任务：使得moe网络近似拟合该linear
-    target_proj.requires_grad_(False)           # 用于生成label，并不需要训练
+    target_proj.requires_grad_(False)                                                       # 用于生成label，并不需要训练
     mse = nn.MSELoss()
     writer = SummaryWriter(log_dir=os.environ.get("TB_LOGDIR")) if rank == 0 else None
 
@@ -72,10 +76,10 @@ def train_tiny_ep(
             y = target_proj(x.float()).to(cfg.out_dtype)
 
         # 2) gating -> top-k route
-        logits = gate(x)
+        logits = gate(x)                        # 这里gate已经变成一个ddp对象，一模一样地分布在多个设备上，在训练时候，会自动同步（allreduce求和或求均值）梯度
         probs = torch.softmax(logits, dim=-1)   # 温度平滑，避免过尖导致路由难训练
         weights, indices = torch.topk(probs, cfg.experts_per_token, dim=-1)
-        indices = indices.to(torch.int64)  # scatter 需要 int64 索引
+        indices = indices.to(torch.int64)       # scatter 需要 int64 索引
         weights = weights.to(torch.float32)
 
         # 2.1 aux loss（负载均衡）
