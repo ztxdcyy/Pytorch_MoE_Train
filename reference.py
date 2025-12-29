@@ -3,7 +3,6 @@ import os
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
-import dataclasses
 from config import MoEConfig
 
 # ---------------- All2All pytorch impl ----------------
