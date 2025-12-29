@@ -27,41 +27,43 @@ def train_tiny_ep(
     aux_alpha: float = 1e-2,
     profile: bool = False,
 ):
-    """Minimal EP-only training loop to sanity check all-to-all wiring."""
-    # 分布式相关初始化
+    """Minimal EP-only training loop using EPMoE layer."""
+    # 分布式环境初始化
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    # cuda: 0, 1
+    # 设备分配：cuda: 0, 1, ...
     device = (
         torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
         if torch.cuda.is_available()
         else torch.device("cpu")
     )
     if device.type == "cuda":
-        torch.cuda.set_device(device.index)     # 绑定 rank 到cuda device
+        torch.cuda.set_device(device.index)     # 绑定rank到对应的GPU设备
 
+    # 使用EPMoE层构建模型（包含gate、experts和all-to-all通信）
     model = EPMoE(cfg, rank=rank, world_size=world_size).to(device)
     if world_size > 1:
         model.gate = DDP(model.gate, device_ids=[device] if device.type == "cuda" else None)
 
-    # 训练相关（优化器和模拟的任务——训练moe拟合一个nn.Linear()）初始化
+    # 训练配置：优化器、目标函数和监控工具
     opt = torch.optim.AdamW(list(model.gate.parameters()) + list(model.experts.parameters()), lr=lr)
-    target_proj = torch.nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False).to(device)  # 给定一个模拟训练任务：使得moe网络近似拟合该linear
-    target_proj.requires_grad_(False)                                                       # 用于生成label，并不需要训练
+    target_proj = torch.nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False).to(device)  # 模拟任务：训练MoE网络拟合线性变换
+    target_proj.requires_grad_(False)                                                       # 目标网络不参与训练，仅用于生成标签
     mse = torch.nn.MSELoss()
     writer = SummaryWriter(log_dir=os.environ.get("TB_LOGDIR")) if rank == 0 else None
 
     start_time = time.perf_counter()
     last_log_time = start_time
     for step in range(steps):
-        # 1) synthetic data
+        # 1) 生成模拟数据
         x = torch.randn(bsz, cfg.hidden_dim, device=device, dtype=cfg.in_dtype)
         with torch.no_grad():
             y = target_proj(x.float()).to(cfg.out_dtype)
 
+        # 2) EPMoE前向计算（包含路由、all-to-all通信、专家计算和结果聚合）
         out_tokens, aux_loss = model(x)
 
-        # 6) loss & step
+        # 3) 损失计算和反向传播
         task_loss = mse(out_tokens.float(), y)
         total_loss = task_loss + aux_alpha * aux_loss
         opt.zero_grad(set_to_none=True)
@@ -106,4 +108,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
